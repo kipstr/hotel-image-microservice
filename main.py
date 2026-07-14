@@ -1,6 +1,6 @@
 import os
 import time
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse
 from PIL import Image
 
@@ -9,83 +9,125 @@ app = FastAPI()
 CACHE_DIR = "image_cache"
 ORIGINALS_DIR = "hotel_images"
 
-# Конфигурация инвалидации кэша: время жизни файлов 24 часа (в секундах)
-CACHE_TTL_SECONDS = 86400
-
-# Разрешенные форматы исходных изображений
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+CACHE_TTL_SECONDS = 86400  # 24 часа
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(ORIGINALS_DIR, exist_ok=True)
 
 
-# 1. Основной эндпоинт для отдачи и ресайза изображений (GET)
-@app.get("/image")
-def get_image(w: int, h: int, fmt: str, src: str):
-    # Валидация целевого формата (по ТЗ строго WebP)
-    if fmt.lower() != "webp":
-        raise HTTPException(status_code=400, detail="Поддерживается только формат webp")
-
-    # ВАЛИДАЦИЯ 1: Проверка расширения входящего файла
-    _, ext = os.path.splitext(src.lower())
+# --- РЕАЛИЗАЦИЯ POST ДЛЯ ЗАГРУЗКИ ФАЙЛОВ ---
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Загрузка оригинального изображения на сервер.
+    """
+    _, ext = os.path.splitext(file.filename.lower())
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Недопустимый формат файла '{ext}'. Сервер обрабатывает только: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Недопустимый формат. Разрешены: {ALLOWED_EXTENSIONS}")
 
-    original_path = os.path.join(ORIGINALS_DIR, src)
+    # Безопасное сохранение только имени файла (защита от Path Traversal)
+    safe_name = os.path.basename(file.filename)
+    target_path = os.path.join(ORIGINALS_DIR, safe_name)
+
+    try:
+        content = await file.read()
+        with open(target_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла: {str(e)}")
+
+    return {"status": "success", "filename": safe_name, "message": "Файл успешно загружен в hotel_images"}
+
+
+# --- ОСНОВНОЙ ЭНДПОИНТ GET ---
+@app.get("/image")
+def get_image(
+        w: int,
+        h: int,
+        src: str,
+        fmt: str = Query("webp", description="Целевой формат: webp, jpeg, png"),
+        quality: int = Query(80, ge=1, le=100, description="Качество сжатия от 1 до 100")
+):
+    # Защита от Path Traversal. Извлекаем только чистое имя файла!
+    safe_src = os.path.basename(src)
+
+    # Валидация целевого формата (теперь поддерживаем webp, jpeg, png)
+    fmt = fmt.lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in ["webp", "jpeg", "png"]:
+        raise HTTPException(status_code=400, detail="Поддерживаемые форматы fmt: webp, jpeg, png")
+
+    _, ext = os.path.splitext(safe_src.lower())
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Недопустимое расширение оригинала: {ext}")
+
+    original_path = os.path.join(ORIGINALS_DIR, safe_src)
     if not os.path.exists(original_path):
         raise HTTPException(status_code=404, detail="Оригинальное изображение не найдено")
 
-    # ВАЛИДАЦИЯ 2: Проверка физической целостности и структуры картинки
+    # Валидация структуры картинки
     try:
         with Image.open(original_path) as verify_img:
-            verify_img.verify()  # Быстрая проверка, что файл не битый и является картинкой
+            verify_img.verify()
     except Exception:
-        raise HTTPException(status_code=400, detail="Файл поврежден или не является валидным изображением JPEG/PNG")
+        raise HTTPException(status_code=400, detail=f"Файл {safe_src} поврежден или не является картинкой")
 
-    cache_filename = f"{src}_{w}x{h}.{fmt}"
+    # Включаем динамический параметр quality в имя кэша
+    original_size = os.path.getsize(original_path)
+    cache_filename = f"{safe_src}_{w}x{h}_q{quality}.{fmt}"
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
-    # Логика авто-инвалидации по времени (TTL)
-    if os.path.exists(cache_path):
-        file_age = time.time() - os.path.getmtime(cache_path)
-        if file_age > CACHE_TTL_SECONDS:
-            os.remove(cache_path)
-        else:
-            # Кэш актуален (ГОРЯЧИЙ ЗАПРОС)
-            return FileResponse(cache_path, media_type="image/webp", headers={"X-Cache": "HIT"})
+    no_browser_cache_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
 
-    # Обработка «на лету» (ХОЛОДНЫЙ ЗАПРОС)
+    # Проверка актуальности кэша
+    if os.path.exists(cache_path):
+        cache_mtime = os.path.getmtime(cache_path)
+        original_mtime = os.path.getmtime(original_path)
+        file_age = time.time() - cache_mtime
+
+        if file_age > CACHE_TTL_SECONDS or original_mtime > cache_mtime:
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+        else:
+            return FileResponse(cache_path, media_type=f"image/{fmt}",
+                                headers={"X-Cache": "HIT", **no_browser_cache_headers})
+
+            # Обработка «на лету»
     try:
-        # Re-open необходим, так как verify() закрывает дескрипторы файла
         with Image.open(original_path) as img:
             img_resized = img.resize((w, h), Image.Resampling.LANCZOS)
-            img_resized.save(cache_path, format="WEBP", quality=80)
+
+            # Конвертация в зависимости от fmt (с RGBA-адаптацией для JPEG)
+            if fmt == "jpeg" and img_resized.mode in ("RGBA", "P"):
+                img_resized = img_resized.convert("RGB")
+
+            # Передаем динамический quality при сохранении
+            img_resized.save(cache_path, format=fmt.upper(), quality=quality)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
 
-    return FileResponse(cache_path, media_type="image/webp", headers={"X-Cache": "MISS"})
+    return FileResponse(cache_path, media_type=f"image/{fmt}", headers={"X-Cache": "MISS", **no_browser_cache_headers})
 
 
-# 2. Эндпоинт для принудительной инвалидации кэша (DELETE)
+# Эндпоинт для принудительной инвалидации кэша (DELETE)
 @app.delete("/image")
 def invalidate_cache(src: str):
-    if not src:
-        raise HTTPException(status_code=400, detail="Параметр src не может быть пустым")
-
+    safe_src = os.path.basename(src)
     deleted_count = 0
     for filename in os.listdir(CACHE_DIR):
-        if filename.startswith(f"{src}_"):
+        if filename.startswith(f"{safe_src}_"):
             file_path = os.path.join(CACHE_DIR, filename)
             try:
                 os.remove(file_path)
                 deleted_count += 1
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Не удалось удалить файл {filename}: {str(e)}")
-
-    if deleted_count == 0:
-        return {"status": "success", "message": f"Кэш для файла {src} уже пуст или не существовал"}
-
-    return {"status": "success", "message": f"Инвалидация выполнена успешно. Удалено файлов из кэша: {deleted_count}"}
+            except Exception:
+                pass
+    return {"status": "success", "deleted_count": deleted_count}
